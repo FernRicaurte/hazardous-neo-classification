@@ -1,0 +1,906 @@
+---
+title: "Hazardous Celestial Objects: Full Analysis"
+author: "Alejandro Arroyo, Ryujin Bupp, Jose Placeres, Fernando Ricaurte"
+date: "STA 5703 Data Mining Methodology, University of Central Florida, Spring 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+  pdf_document:
+    toc: true
+    number_sections: true
+    latex_engine: xelatex
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{array}
+  - \usepackage{multirow}
+  - \usepackage{float}
+  - \usepackage{colortbl}
+  - \usepackage{threeparttable}
+  - \usepackage{threeparttablex}
+  - \usepackage{makecell}
+  - \usepackage{xcolor}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      dev = "png", dpi = 150)
+```
+
+> **About this version.** This is the team's final analysis with two
+> refinements: (1) every model, from logistic regression to boosting, is
+> evaluated on the same validation and test rows (Section 4.2), and
+> (2) the Random Forest threshold is read from the validation ROC curve rather
+> than typed in, so the results reproduce on any machine (Section 5.1).
+
+# Libraries
+
+```{r libraries}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(knitr)
+library(kableExtra)
+library(readxl)
+library(caret)
+library(randomForest)
+library(pROC)
+library(glmnet)
+library(leaps)
+library(MASS)
+library(gbm)
+library(scales)
+library(tibble)
+library(corrplot)
+library(GGally)
+
+# MASS also defines select(); make sure dplyr's version is used
+select <- dplyr::select
+```
+
+# Data Cleaning and Preprocessing
+
+The raw data is the NASA NeoWs 1950–2025 dataset (375,659 rows, 41 columns),
+available on Kaggle as
+[Near Earth Comets Classification](https://www.kaggle.com/datasets/seniruepasinghe/near-earth-comets-classification-dataset).
+
+If the raw file `data/nasa_neows_1950_2025.csv` is present, the cleaning steps
+below run and produce the cleaned dataset. If it is not, the notebook loads the
+already-cleaned file `data/cleaned_neows_1950_2025.xlsx` (35,430 rows), which
+is the output of these same steps.
+
+```{r raw-flag}
+raw_path   <- "data/nasa_neows_1950_2025.csv"
+clean_path <- "data/cleaned_neows_1950_2025.xlsx"
+have_raw   <- file.exists(raw_path)
+have_raw
+```
+
+## Loading the Raw Dataset
+
+```{r load-raw, eval = have_raw}
+asteroids <- read.csv(raw_path, header = TRUE, stringsAsFactors = FALSE)
+str(asteroids)
+```
+
+## Removing Missing Values
+
+```{r remove-na, eval = have_raw}
+asteroids_clean <- na.omit(asteroids)
+nrow(asteroids_clean)
+```
+
+## Removing Redundant Columns
+
+Name and Equinox are dropped in favor of Neo Reference ID, and duplicate
+unit conversions are dropped to keep a single unit of measurement per quantity.
+
+```{r redundant-cols, eval = have_raw}
+asteroids_clean <- asteroids_clean[, !(names(asteroids_clean) %in% c("Name", "Equinox"))]
+
+superfluous <- c(
+  "Est.Dia.in.KM.min.", "Est.Dia.in.M.min.", "Est.Dia.in.M.max.",
+  "Est.Dia.in.Miles.min.", "Est.Dia.in.Miles.max.",
+  "Est.Dia.in.Feet.min.", "Est.Dia.in.Feet.max.",
+  "Relative.Velocity.km.per.sec", "Miles.per.hour",
+  "Miss.Dist..Astronomical.", "Miss.Dist..lunar.", "Miss.Dist..miles."
+)
+asteroids_clean <- asteroids_clean[, !(names(asteroids_clean) %in% superfluous)]
+colnames(asteroids_clean)
+```
+
+## Filtering to Earth-Orbiting Objects
+
+```{r earth-only, eval = have_raw}
+unique(asteroids_clean$Orbiting.Body)
+asteroids_clean <- asteroids_clean[asteroids_clean$Orbiting.Body == "Earth", ]
+unique(asteroids_clean$Orbiting.Body)
+```
+
+## Removing Duplicate Objects
+
+Each asteroid appears once per close approach. Keeping one row per
+Neo Reference ID prevents the same object from landing in both the training
+and test sets (data leakage).
+
+```{r dedupe, eval = have_raw}
+sum(duplicated(asteroids_clean$Neo.Reference.ID))
+asteroids_clean <- asteroids_clean[!duplicated(asteroids_clean$Neo.Reference.ID), ]
+sum(duplicated(asteroids_clean$Neo.Reference.ID))
+```
+
+## Final Null Check
+
+```{r null-check, eval = have_raw}
+asteroids_clean <- na.omit(asteroids_clean)
+colSums(is.na(asteroids_clean))
+```
+
+## Loading the Cleaned Dataset (if the raw file is absent)
+
+```{r load-clean, eval = !have_raw}
+asteroids_clean <- as.data.frame(read_excel(clean_path))
+# One value is stored as text in scientific notation; convert it to numeric
+asteroids_clean$Minimum.Orbit.Intersection <-
+  as.numeric(asteroids_clean$Minimum.Orbit.Intersection)
+asteroids_clean$Miss.Dist..kilometers. <-
+  as.numeric(asteroids_clean$Miss.Dist..kilometers.)
+str(asteroids_clean)
+```
+
+# Exploratory Data Analysis
+
+```{r eda-class}
+ggplot(asteroids_clean, aes(x = as.factor(Hazardous), fill = as.factor(Hazardous))) +
+  geom_bar() +
+  theme_minimal() +
+  labs(title = "Class Distribution: Hazardous vs Non-Hazardous",
+       x = "Hazardous", y = "Count", fill = "Hazardous")
+
+prop.table(table(asteroids_clean$Hazardous))
+```
+
+```{r eda-miss-dist}
+ggplot(asteroids_clean, aes(x = Miss.Dist..kilometers.)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "black") +
+  theme_minimal() +
+  labs(title = "Distribution of Miss Distance", x = "Miss Distance (km)", y = "Count")
+```
+
+```{r eda-velocity}
+ggplot(asteroids_clean, aes(x = Relative.Velocity.km.per.hr, y = Miss.Dist..kilometers.)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", color = "red") +
+  theme_minimal() +
+  labs(title = "Velocity vs Miss Distance",
+       x = "Relative Velocity (km/hr)", y = "Miss Distance (km)")
+```
+
+```{r eda-magnitude}
+ggplot(asteroids_clean, aes(x = Absolute.Magnitude, y = Miss.Dist..kilometers.)) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  geom_smooth(method = "lm", color = "red") +
+  theme_minimal() +
+  labs(title = "Absolute Magnitude vs Miss Distance",
+       x = "Absolute Magnitude", y = "Miss Distance (km)")
+```
+
+Spearman correlation is used because several variables are heavily skewed.
+
+```{r eda-corr, fig.width = 9, fig.height = 9}
+numeric_data <- select_if(asteroids_clean, is.numeric)
+cor_matrix <- cor(numeric_data, method = "spearman", use = "complete.obs")
+corrplot(cor_matrix, method = "color", type = "upper", order = "hclust",
+         tl.col = "black", tl.cex = 0.7, tl.srt = 45)
+```
+
+```{r eda-pairs, fig.width = 9, fig.height = 9}
+subset_vars <- asteroids_clean %>%
+  dplyr::select(Miss.Dist..kilometers., Relative.Velocity.km.per.hr,
+                Absolute.Magnitude, Orbital.Period, Minimum.Orbit.Intersection)
+ggpairs(subset_vars)
+```
+
+# Variable Selection: Logistic Regression, Ridge, and LASSO
+
+## Data Preparation
+
+```{r prep}
+# Drop all non-predictive columns once for use across all models
+shared_drop <- c("Date", "Neo.Reference.ID", "Close.Approach.Date",
+                 "Orbit.Determination.Date", "Epoch.Date.Close.Approach",
+                 "Orbit.ID", "Perihelion.Time", "Orbiting.Body")
+model_data <- asteroids_clean[, !(names(asteroids_clean) %in% shared_drop)]
+
+# Convert all predictors to numeric
+predictor_names <- setdiff(names(model_data), "Hazardous")
+model_data <- model_data %>%
+  mutate(across(all_of(predictor_names), ~ as.numeric(as.character(.))))
+
+# hco_data: numeric Hazardous (1/0) for logistic regression, Ridge, LASSO
+hco_data <- model_data
+hco_data$Hazardous <- ifelse(as.character(model_data$Hazardous) %in% c("True", "TRUE"), 1, 0)
+
+# comets_model: factor Hazardous for Random Forest, Boosting, Bagging
+comets_model <- model_data
+comets_model$Hazardous <- factor(
+  ifelse(as.character(model_data$Hazardous) %in% c("True", "TRUE"), "TRUE", "FALSE"),
+  levels = c("FALSE", "TRUE")
+)
+```
+
+## Train / Validation / Test Split
+
+A single stratified 60/20/20 split is shared by every model.
+
+> **Correction (post-course).** In the original notebook, the Step 2 sets were
+> built with `hco_data[val_idx, ]` and `hco_data[-c(train_idx, val_idx), ]`.
+> But `val_idx` holds row positions *within* `temp` (the 40% held out from
+> training), not within the full dataset, so the Step 2 validation and test
+> sets overlapped the training set. The lines below take `val_idx` from the
+> held-out rows, so Step 2 now uses exactly the same validation and test rows
+> as the ensemble models.
+
+```{r split}
+set.seed(5703)
+train_idx   <- createDataPartition(comets_model$Hazardous, p = 0.6, list = FALSE)
+comet_train <- comets_model[train_idx, ]
+temp        <- comets_model[-train_idx, ]
+
+val_idx    <- createDataPartition(temp$Hazardous, p = 0.5, list = FALSE)
+comet_val  <- temp[val_idx, ]
+comet_test <- temp[-val_idx, ]
+
+minority_n <- min(table(comet_train$Hazardous))
+
+# Same rows for the Step 2 models (corrected indexing)
+hco_heldout         <- hco_data[-train_idx, ]
+train_hco_data      <- hco_data[train_idx, ]
+validation_hco_data <- hco_heldout[val_idx, ]
+test_hco_data       <- hco_heldout[-val_idx, ]
+
+# Sanity checks: no overlap, and the two versions line up row for row
+stopifnot(nrow(train_hco_data) + nrow(validation_hco_data) + nrow(test_hco_data) == nrow(hco_data))
+stopifnot(all(validation_hco_data$Hazardous == as.numeric(comet_val$Hazardous == "TRUE")))
+stopifnot(all(test_hco_data$Hazardous == as.numeric(comet_test$Hazardous == "TRUE")))
+
+c(train = nrow(comet_train), validation = nrow(comet_val), test = nrow(comet_test))
+table(comet_train$Hazardous)
+```
+
+## Baseline Logistic Regression
+
+```{r baseline-logit}
+baseline_model_hco_data <- glm(Hazardous ~ ., data = train_hco_data, family = binomial)
+summary(baseline_model_hco_data)
+```
+
+`Aphelion.Dist` has an `NA` coefficient because it is an exact linear
+combination of the semi-major axis and perihelion distance.
+
+## Best Subset Selection
+
+```{r best-subset}
+best_subset_hco_data <- regsubsets(Hazardous ~ ., data = train_hco_data,
+                                   nvmax = 19, method = "exhaustive")
+summary_best_subset_hco_data <- summary(best_subset_hco_data)
+best_model_bic <- which.min(summary_best_subset_hco_data$bic)
+coefficients_best_model <- coef(best_subset_hco_data, best_model_bic)
+
+kable(
+  data.frame(
+    Vars  = 1:length(summary_best_subset_hco_data$adjr2),
+    AdjR2 = round(summary_best_subset_hco_data$adjr2, 4),
+    BIC   = round(summary_best_subset_hco_data$bic, 4),
+    CP    = round(summary_best_subset_hco_data$cp, 4)
+  ),
+  caption = "Best Subset Selection Performance Metrics",
+  col.names = c("Number of Variables", "Adj R-Squared", "BIC", "Mallows' Cp"),
+  align = "c"
+) %>% kable_styling(position = "left", full_width = FALSE)
+
+kable(
+  data.frame(Variable = sub("(Intercept)", "Intercept", names(coefficients_best_model), fixed = TRUE),
+             Coefficient = round(as.numeric(coefficients_best_model), 6)),
+  caption = paste("Variables Selected by Best Subset Selection (Size =", best_model_bic, ")"),
+  col.names = c("Variable Name", "Estimated Coefficient"),
+  align = "l"
+) %>% kable_styling(position = "left", full_width = FALSE)
+```
+
+```{r best-subset-plots, fig.width = 10, fig.height = 4}
+par(mfrow = c(1, 3))
+plot(summary_best_subset_hco_data$adjr2, xlab = "Number of Variables",
+     ylab = "Adjusted R²", type = "l", main = "Adjusted R²")
+points(which.max(summary_best_subset_hco_data$adjr2),
+       max(summary_best_subset_hco_data$adjr2), col = "red", cex = 2, pch = 20)
+plot(summary_best_subset_hco_data$cp, xlab = "Number of Variables",
+     ylab = "Cp", type = "l", main = "Cp")
+points(which.min(summary_best_subset_hco_data$cp),
+       min(summary_best_subset_hco_data$cp), col = "red", cex = 2, pch = 20)
+plot(summary_best_subset_hco_data$bic, xlab = "Number of Variables",
+     ylab = "BIC", type = "l", main = "BIC")
+points(which.min(summary_best_subset_hco_data$bic),
+       min(summary_best_subset_hco_data$bic), col = "red", cex = 2, pch = 20)
+par(mfrow = c(1, 1))
+```
+
+## Stepwise Selection (Bidirectional)
+
+```{r stepwise}
+train_hco_data$Hazardous      <- as.factor(train_hco_data$Hazardous)
+validation_hco_data$Hazardous <- as.factor(validation_hco_data$Hazardous)
+test_hco_data$Hazardous       <- as.factor(test_hco_data$Hazardous)
+
+full_model_hco_data <- glm(Hazardous ~ ., data = train_hco_data, family = binomial)
+stepwise_hco_data   <- stepAIC(full_model_hco_data, direction = "both", trace = FALSE)
+summary(stepwise_hco_data)
+
+kable(
+  data.frame(Variable = sub("(Intercept)", "Intercept", names(coef(stepwise_hco_data)), fixed = TRUE),
+             Coefficient = round(as.numeric(coef(stepwise_hco_data)), 6)),
+  caption = "Variables Selected by Stepwise Selection (Bidirectional)",
+  col.names = c("Variable Name", "Estimated Coefficient"),
+  align = "l"
+) %>% kable_styling(position = "left", full_width = FALSE)
+```
+
+## Ridge Regression
+
+```{r ridge}
+train_hco_data$Hazardous      <- as.numeric(as.character(train_hco_data$Hazardous))
+validation_hco_data$Hazardous <- as.numeric(as.character(validation_hco_data$Hazardous))
+test_hco_data$Hazardous       <- as.numeric(as.character(test_hco_data$Hazardous))
+
+predictors_train_hco_data      <- as.matrix(train_hco_data[, colnames(train_hco_data) != "Hazardous"])
+target_train_hco_data          <- train_hco_data$Hazardous
+predictors_validation_hco_data <- as.matrix(validation_hco_data[, names(validation_hco_data) != "Hazardous"])
+target_validation_hco_data     <- validation_hco_data$Hazardous
+
+set.seed(5703)
+ridge_5_fold_hco_data <- cv.glmnet(predictors_train_hco_data, target_train_hco_data,
+                                   alpha = 0, family = "binomial", nfolds = 5)
+ridge_lambda_min_hco_data <- ridge_5_fold_hco_data$lambda.min
+ridge_lambda_1se_hco_data <- ridge_5_fold_hco_data$lambda.1se
+
+predict_response_ridge_min <- predict(ridge_5_fold_hco_data, newx = predictors_validation_hco_data,
+                                      s = ridge_lambda_min_hco_data, type = "response")
+predict_response_ridge_1se <- predict(ridge_5_fold_hco_data, newx = predictors_validation_hco_data,
+                                      s = ridge_lambda_1se_hco_data, type = "response")
+predict_class_ridge_min    <- predict(ridge_5_fold_hco_data, newx = predictors_validation_hco_data,
+                                      s = ridge_lambda_min_hco_data, type = "class")
+
+kable(
+  data.frame(
+    Metric = c("Lambda.min", "Lambda.1se", "Error (min)", "MSE (min)", "MSE (1se)"),
+    Value  = c(round(ridge_lambda_min_hco_data, 6),
+               round(ridge_lambda_1se_hco_data, 6),
+               round(mean(predict_class_ridge_min != target_validation_hco_data), 6),
+               round(mean((target_validation_hco_data - predict_response_ridge_min)^2), 6),
+               round(mean((target_validation_hco_data - predict_response_ridge_1se)^2), 6))
+  ),
+  align = "c", caption = "Ridge Regression 5-fold Cross Validation"
+) %>% kable_styling(position = "left", full_width = FALSE)
+
+ridge_fit_hco_data <- glmnet(predictors_train_hco_data, target_train_hco_data,
+                             alpha = 0, family = "binomial")
+plot(ridge_fit_hco_data)
+title("Ridge Regression: Coefficients vs. Log(Lambda)", line = 3)
+
+roc_lambda_min_ridge <- roc(target_validation_hco_data, predict_response_ridge_min[, 1], quiet = TRUE)
+plot(roc_lambda_min_ridge, col = "blue", main = "Ridge ROC lambda.min")
+legend("bottomright",
+       legend = paste("Lambda.min (AUC =", round(auc(roc_lambda_min_ridge), 6), ")"))
+```
+
+## LASSO Regression
+
+```{r lasso}
+set.seed(5703)
+lasso_5_fold_hco_data <- cv.glmnet(predictors_train_hco_data, target_train_hco_data,
+                                   alpha = 1, family = "binomial", nfolds = 5)
+lasso_lambda_min_hco_data <- lasso_5_fold_hco_data$lambda.min
+lasso_lambda_1se_hco_data <- lasso_5_fold_hco_data$lambda.1se
+
+predict_response_lasso_min <- predict(lasso_5_fold_hco_data, newx = predictors_validation_hco_data,
+                                      s = lasso_lambda_min_hco_data, type = "response")
+
+lasso_fit_hco_data <- glmnet(predictors_train_hco_data, target_train_hco_data,
+                             alpha = 1, family = "binomial")
+plot(lasso_fit_hco_data)
+title("LASSO Regression: Coefficients vs. Log(Lambda)", line = 3)
+
+roc_lambda_min_lasso <- roc(target_validation_hco_data, predict_response_lasso_min[, 1], quiet = TRUE)
+plot(roc_lambda_min_lasso, col = "blue", main = "LASSO ROC lambda.min")
+legend("bottomright",
+       legend = paste("Lambda.min (AUC =", round(auc(roc_lambda_min_lasso), 6), ")"))
+```
+
+## Step 2 Model Comparison (Validation Set)
+
+```{r step2-compare}
+val_hazardous_numeric <- as.numeric(as.character(validation_hco_data$Hazardous))
+
+best_vars <- names(coef(best_subset_hco_data, best_model_bic))
+best_vars <- best_vars[best_vars != "(Intercept)"]
+form_best <- as.formula(paste("Hazardous ~", paste(best_vars, collapse = " + ")))
+fit_best  <- glm(form_best, data = train_hco_data, family = binomial)
+
+pred_baseline <- predict(baseline_model_hco_data, newdata = validation_hco_data, type = "response")
+pred_stepwise <- predict(stepwise_hco_data,       newdata = validation_hco_data, type = "response")
+pred_best     <- predict(fit_best,                newdata = validation_hco_data, type = "response")
+pred_ridge    <- predict(ridge_5_fold_hco_data, newx = predictors_validation_hco_data,
+                         s = ridge_lambda_min_hco_data, type = "response")[, 1]
+pred_lasso    <- predict(lasso_5_fold_hco_data, newx = predictors_validation_hco_data,
+                         s = lasso_lambda_min_hco_data, type = "response")[, 1]
+
+roc_baseline <- roc(val_hazardous_numeric, pred_baseline, quiet = TRUE)
+roc_stepwise <- roc(val_hazardous_numeric, pred_stepwise, quiet = TRUE)
+roc_best     <- roc(val_hazardous_numeric, pred_best,     quiet = TRUE)
+roc_ridge    <- roc(val_hazardous_numeric, pred_ridge,    quiet = TRUE)
+roc_lasso    <- roc(val_hazardous_numeric, pred_lasso,    quiet = TRUE)
+
+step2_table <- data.frame(
+  Method = c("Baseline (Full Logistic)", "Stepwise (Bidirectional)",
+             "Best Subset", "Ridge (lambda.min)", "LASSO (lambda.min)"),
+  Variables = c(length(coef(baseline_model_hco_data)) - 1,
+                length(coef(stepwise_hco_data)) - 1,
+                best_model_bic,
+                sum(coef(ridge_5_fold_hco_data, s = ridge_lambda_min_hco_data) != 0) - 1,
+                sum(coef(lasso_5_fold_hco_data, s = lasso_lambda_min_hco_data) != 0) - 1),
+  AIC = c(round(AIC(baseline_model_hco_data), 4), round(AIC(stepwise_hco_data), 4),
+          round(AIC(fit_best), 4), NA, NA),
+  AUC = round(c(as.numeric(auc(roc_baseline)), as.numeric(auc(roc_stepwise)),
+                as.numeric(auc(roc_best)), as.numeric(auc(roc_ridge)),
+                as.numeric(auc(roc_lasso))), 4)
+)
+
+kable(step2_table,
+      caption = "Final Model Comparison Across All Step 2 Methods (Validation Set)",
+      col.names = c("Method", "Variables Used", "AIC (Training)", "AUC (Validation)"),
+      align = "c") %>%
+  kable_styling(position = "left", full_width = FALSE)
+
+plot(roc_baseline, col = "black", lwd = 2, main = "ROC Curve Comparison: All Step 2 Models")
+lines(roc_stepwise, col = "blue",   lwd = 2)
+lines(roc_best,     col = "red",    lwd = 2)
+lines(roc_ridge,    col = "green",  lwd = 2)
+lines(roc_lasso,    col = "orange", lwd = 2)
+legend("bottomright",
+       legend = c(paste("Baseline (AUC =",    round(as.numeric(auc(roc_baseline)), 4), ")"),
+                  paste("Stepwise (AUC =",    round(as.numeric(auc(roc_stepwise)), 4), ")"),
+                  paste("Best Subset (AUC =", round(as.numeric(auc(roc_best)), 4), ")"),
+                  paste("Ridge (AUC =",       round(as.numeric(auc(roc_ridge)), 4), ")"),
+                  paste("LASSO (AUC =",       round(as.numeric(auc(roc_lasso)), 4), ")")),
+       col = c("black", "blue", "red", "green", "orange"), lwd = 2)
+```
+
+# Ensemble Methods: Random Forest, Boosting, and Bagging
+
+Each forest draws an equal number of hazardous and non-hazardous objects per
+tree (`sampsize`), which balances the classes during training only. The
+validation and test sets keep the real-world 93/7 class ratio.
+
+## Random Forest
+
+### Model 1: Baseline Random Forest
+
+```{r rf1}
+set.seed(5703)
+comet_rf_model <- randomForest(
+  Hazardous ~ ., data = comet_train, ntree = 500,
+  mtry = floor(sqrt(ncol(comet_train) - 1)),
+  sampsize = c("FALSE" = minority_n, "TRUE" = minority_n),
+  importance = TRUE
+)
+comet_preds <- predict(comet_rf_model, newdata = comet_val)
+confusionMatrix(comet_preds, comet_val$Hazardous, positive = "TRUE")
+```
+
+### mtry Tuning via OOB Error
+
+```{r rf-tune}
+set.seed(5703)
+comet_tuned <- tuneRF(
+  x = comet_train[, -which(names(comet_train) == "Hazardous")],
+  y = comet_train$Hazardous,
+  stepFactor = 1.5, improve = 0.01, ntreeTry = 300, trace = TRUE, plot = TRUE
+)
+```
+
+### Model 2: Tuned mtry with Class Weights
+
+```{r rf2}
+set.seed(5703)
+comet_rf_model_tune <- randomForest(
+  Hazardous ~ ., data = comet_train, ntree = 500, mtry = 4,
+  sampsize = c("FALSE" = minority_n, "TRUE" = minority_n),
+  classwt = c("FALSE" = 1, "TRUE" = 10),
+  importance = TRUE
+)
+comet_preds_1 <- predict(comet_rf_model_tune, newdata = comet_val)
+confusionMatrix(comet_preds_1, comet_val$Hazardous, positive = "TRUE")
+```
+
+### Model 3: Lowered Classification Threshold
+
+```{r rf3}
+set.seed(5703)
+comet_rf_model_tune_1 <- randomForest(
+  Hazardous ~ ., data = comet_train, ntree = 500, mtry = 4,
+  sampsize = c("FALSE" = minority_n, "TRUE" = minority_n),
+  importance = TRUE
+)
+pred_probs_1 <- predict(comet_rf_model_tune_1, newdata = as.data.frame(comet_val), type = "prob")
+pred_class_1 <- factor(ifelse(pred_probs_1[, "TRUE"] >= 0.15, "TRUE", "FALSE"),
+                       levels = c("FALSE", "TRUE"))
+confusionMatrix(pred_class_1, comet_val$Hazardous, positive = "TRUE")
+```
+
+### Model 4: ROC-Optimized Threshold (Final RF Model)
+
+Rather than guessing a cutoff, the threshold is read directly from the
+validation ROC curve: the point that best balances sensitivity and
+specificity (Youden's index). The same method is used for boosting below.
+
+```{r rf4}
+set.seed(5703)
+comet_rf_model_tune_2 <- randomForest(
+  Hazardous ~ ., data = comet_train, ntree = 500, mtry = 4,
+  sampsize = c("FALSE" = minority_n, "TRUE" = minority_n),
+  importance = TRUE
+)
+
+pred_probs_2 <- predict(comet_rf_model_tune_2, newdata = as.data.frame(comet_val), type = "prob")
+
+roc_rf_val   <- roc(comet_val$Hazardous, pred_probs_2[, "TRUE"], quiet = TRUE)
+rf_threshold <- coords(roc_rf_val, "best", ret = "threshold", transpose = FALSE)$threshold[1]
+plot(roc_rf_val, print.thres = "best", print.auc = TRUE,
+     main = "Random Forest: Optimal Threshold of Validation Set")
+cat("Optimal Threshold Cutoff:", rf_threshold, "\n")
+
+pred_class_2 <- factor(ifelse(pred_probs_2[, "TRUE"] >= rf_threshold, "TRUE", "FALSE"),
+                       levels = c("FALSE", "TRUE"))
+confusionMatrix(pred_class_2, comet_val$Hazardous, positive = "TRUE")
+```
+
+### Final RF Test Set Evaluation
+
+```{r rf-test}
+pred_probs_3 <- predict(comet_rf_model_tune_2, newdata = as.data.frame(comet_test), type = "prob")
+pred_class_3 <- factor(ifelse(pred_probs_3[, "TRUE"] >= rf_threshold, "TRUE", "FALSE"),
+                       levels = c("FALSE", "TRUE"))
+confusionMatrix(pred_class_3, comet_test$Hazardous, positive = "TRUE")
+```
+
+## Gradient Boosting
+
+### Data Recoding for Boosting Compatibility
+
+caret needs class labels that are valid R names, so TRUE/FALSE become Yes/No.
+
+```{r boost-recode}
+recode_yes_no <- function(d) {
+  d$Hazardous <- factor(ifelse(d$Hazardous == "TRUE", "Yes", "No"), levels = c("No", "Yes"))
+  d
+}
+comet_train_boost <- recode_yes_no(comet_train)
+comet_val_boost   <- recode_yes_no(comet_val)
+comet_test_boost  <- recode_yes_no(comet_test)
+```
+
+### Model Training: 5-Fold CV with Grid Search
+
+Down-sampling is applied inside each training fold only, and the list of
+seeds makes the grid search reproducible.
+
+```{r boost-train}
+set.seed(5703)
+gbm_grid <- expand.grid(interaction.depth = 1:5,
+                        n.trees = seq(100, 600, by = 100),
+                        shrinkage = c(0.001, 0.01, 0.1),
+                        n.minobsinnode = c(10, 20))
+
+n_models <- nrow(gbm_grid)
+setSeeds <- vector(mode = "list", length = 6)
+for (i in 1:5) setSeeds[[i]] <- sample.int(100000, n_models)
+setSeeds[[6]] <- sample.int(100000, 1)
+
+fitControl <- trainControl(method = "cv", number = 5, classProbs = TRUE,
+                           summaryFunction = twoClassSummary,
+                           sampling = "down", seeds = setSeeds)
+
+model_boost <- train(Hazardous ~ ., data = comet_train_boost,
+                     method = "gbm", distribution = "bernoulli",
+                     trControl = fitControl, tuneGrid = gbm_grid,
+                     metric = "ROC", verbose = FALSE)
+```
+
+### Optimal Tuning and Variable Importance
+
+```{r boost-best}
+model_boost$bestTune
+plot(varImp(model_boost), top = 10, main = "Boosting: Variable Importance")
+```
+
+### Validation Set ROC: Threshold Selection
+
+Because the model trained on 50/50 down-sampled folds, its predicted
+probabilities run high for a dataset where only 7% of objects are hazardous.
+That is why the ROC-optimal cutoff lands well above 0.5.
+
+```{r boost-threshold}
+probs_boost_val <- predict(model_boost, newdata = comet_val_boost, type = "prob")[, "Yes"]
+roc_boost_val   <- roc(response = comet_val_boost$Hazardous, predictor = probs_boost_val, quiet = TRUE)
+plot(roc_boost_val, print.thres = "best", print.auc = TRUE, col = "blue",
+     main = "ROC: Optimal Threshold of Validation Set")
+
+optimal   <- coords(roc_boost_val, "best", ret = c("threshold", "specificity", "sensitivity"),
+                    transpose = FALSE)
+threshold <- optimal$threshold[1]
+cat("Optimal Threshold Cutoff:", threshold, "\n")
+```
+
+### Validation Set Evaluation
+
+```{r boost-val}
+preds_boost_val <- factor(ifelse(probs_boost_val >= threshold, "Yes", "No"), levels = c("No", "Yes"))
+cm_boost_val    <- confusionMatrix(preds_boost_val, comet_val_boost$Hazardous, positive = "Yes")
+cm_boost_val
+cat("ROC-AUC:", round(auc(roc_boost_val), 4), "\n")
+```
+
+### Test Set Evaluation
+
+```{r boost-test}
+probs_boost_test <- predict(model_boost, newdata = comet_test_boost, type = "prob")[, "Yes"]
+preds_boost_test <- factor(ifelse(probs_boost_test >= threshold, "Yes", "No"), levels = c("No", "Yes"))
+cm_boost_test    <- confusionMatrix(preds_boost_test, comet_test_boost$Hazardous, positive = "Yes")
+cm_boost_test
+
+roc_boost <- roc(response = comet_test_boost$Hazardous, predictor = probs_boost_test,
+                 levels = c("No", "Yes"), direction = "<", quiet = TRUE)
+ROC_AUC <- round(auc(roc_boost), 4)
+cat("ROC-AUC:", ROC_AUC, "\n")
+
+plot(roc_boost, col = "forestgreen", main = "ROC Curve: Gradient Boosting (Test)", lwd = 2)
+```
+
+## Bagging
+
+Bagging is a random forest that considers every predictor at each split
+(`mtry = p`).
+
+### Model Fitting: 100, 300, 500 Trees
+
+```{r bag-fit}
+p <- ncol(comet_train) - 1
+
+set.seed(5703)
+bag_100 <- randomForest(Hazardous ~ ., data = comet_train, mtry = p, ntree = 100,
+                        sampsize = c("FALSE" = minority_n, "TRUE" = minority_n), importance = TRUE)
+set.seed(5703)
+bag_300 <- randomForest(Hazardous ~ ., data = comet_train, mtry = p, ntree = 300,
+                        sampsize = c("FALSE" = minority_n, "TRUE" = minority_n), importance = TRUE)
+set.seed(5703)
+bag_500 <- randomForest(Hazardous ~ ., data = comet_train, mtry = p, ntree = 500,
+                        sampsize = c("FALSE" = minority_n, "TRUE" = minority_n), importance = TRUE)
+bag_100
+bag_300
+bag_500
+```
+
+### OOB Error Plots
+
+```{r bag-oob}
+plot(bag_100, main = "Bagging OOB Error: 100 Trees")
+plot(bag_300, main = "Bagging OOB Error: 300 Trees")
+plot(bag_500, main = "Bagging OOB Error: 500 Trees")
+```
+
+### Validation Set Comparison
+
+```{r bag-val}
+get_classification_metrics <- function(model, newdata, truth_col = "Hazardous",
+                                       positive_class = "TRUE", threshold = 0.5) {
+  pred_prob  <- predict(model, newdata = newdata, type = "prob")[, positive_class]
+  pred_class <- factor(ifelse(pred_prob >= threshold, "TRUE", "FALSE"), levels = c("FALSE", "TRUE"))
+  cm <- confusionMatrix(pred_class, newdata[[truth_col]], positive = positive_class)
+  roc_obj <- roc(response = newdata[[truth_col]], predictor = pred_prob,
+                 levels = c("FALSE", "TRUE"), direction = "<", quiet = TRUE)
+  data.frame(
+    Accuracy    = as.numeric(cm$overall["Accuracy"]),
+    Precision   = as.numeric(cm$byClass["Pos Pred Value"]),
+    Recall      = as.numeric(cm$byClass["Sensitivity"]),
+    Specificity = as.numeric(cm$byClass["Specificity"]),
+    F1          = as.numeric(cm$byClass["F1"]),
+    AUC         = as.numeric(auc(roc_obj))
+  )
+}
+
+# A deliberately low threshold: an object is flagged if even 2.5% of trees vote
+# "hazardous". This prioritizes recall (missing a hazardous object is the costly
+# error) at the price of more false alarms. It is chosen on validation and
+# reused unchanged on the test set.
+bag_threshold <- 0.025
+
+validation_results <- rbind(
+  cbind(Model = "Bagging_100", get_classification_metrics(bag_100, comet_val, threshold = bag_threshold)),
+  cbind(Model = "Bagging_300", get_classification_metrics(bag_300, comet_val, threshold = bag_threshold)),
+  cbind(Model = "Bagging_500", get_classification_metrics(bag_500, comet_val, threshold = bag_threshold))
+)
+kable(validation_results, caption = "Bagging Validation Set Results", align = "c", digits = 4) %>%
+  kable_styling(position = "left", full_width = FALSE)
+```
+
+### Final Bagging Model: Test Set Evaluation
+
+The same threshold chosen on the validation set is applied to the test set.
+
+```{r bag-test}
+final_bag      <- bag_300
+bag_pred_prob  <- predict(final_bag, newdata = comet_test, type = "prob")[, "TRUE"]
+bag_pred_class <- factor(ifelse(bag_pred_prob >= bag_threshold, "TRUE", "FALSE"),
+                         levels = c("FALSE", "TRUE"))
+bag_cm <- confusionMatrix(bag_pred_class, comet_test$Hazardous, positive = "TRUE")
+bag_cm
+
+bag_roc <- roc(response = comet_test$Hazardous, predictor = bag_pred_prob,
+               levels = c("FALSE", "TRUE"), direction = "<", quiet = TRUE)
+bag_auc <- as.numeric(auc(bag_roc))
+bag_auc
+
+plot(bag_roc, col = "blue", main = "ROC Curve - Bagging Model")
+varImpPlot(final_bag, main = "Variable Importance - Final Bagging Model")
+```
+
+# Model Comparison
+
+## Confusion Matrices
+
+```{r cm-all}
+rf_cm <- confusionMatrix(pred_class_3, comet_test$Hazardous, positive = "TRUE")
+
+cat("=== Random Forest - Test Confusion Matrix ===\n"); print(rf_cm$table)
+cat("\n=== Bagging - Test Confusion Matrix ===\n");     print(bag_cm$table)
+cat("\n=== Boosting - Test Confusion Matrix ===\n");    print(cm_boost_test$table)
+```
+
+## ROC Curve Comparison
+
+```{r roc-all}
+roc_rf  <- roc(comet_test$Hazardous, pred_probs_3[, "TRUE"], levels = c("FALSE", "TRUE"), quiet = TRUE)
+roc_bag <- roc(comet_test$Hazardous, bag_pred_prob,          levels = c("FALSE", "TRUE"), quiet = TRUE)
+
+plot(roc_rf, col = "blue", lwd = 2,
+     main = "ROC Curve Comparison: RF vs Bagging vs Boosting", legacy.axes = TRUE)
+lines(roc_bag,   col = "darkgreen", lwd = 2)
+lines(roc_boost, col = "red",       lwd = 2)
+legend("bottomright",
+       legend = c(paste("Random Forest (AUC =", round(auc(roc_rf), 4), ")"),
+                  paste("Bagging (AUC =",       round(auc(roc_bag), 4), ")"),
+                  paste("Boosting (AUC =",      round(auc(roc_boost), 4), ")")),
+       col = c("blue", "darkgreen", "red"), lwd = 2)
+```
+
+## Metrics Comparison Table
+
+```{r compare-table}
+ens_row <- function(cm, auc_value) {
+  c(Accuracy    = round(cm$overall["Accuracy"], 4),
+    Sensitivity = round(cm$byClass["Sensitivity"], 4),
+    Specificity = round(cm$byClass["Specificity"], 4),
+    Kappa       = round(cm$overall["Kappa"], 4),
+    F1          = round(cm$byClass["F1"], 4),
+    AUC         = round(auc_value, 4),
+    FN          = cm$table[1, 2],
+    FP          = cm$table[2, 1])
+}
+
+comparison_table <- data.frame(
+  Model = c("Random Forest", "Bagging", "Boosting"),
+  rbind(ens_row(rf_cm, as.numeric(auc(roc_rf))),
+        ens_row(bag_cm, bag_auc),
+        ens_row(cm_boost_test, as.numeric(ROC_AUC)))
+)
+names(comparison_table) <- c("Model", "Accuracy", "Sensitivity", "Specificity",
+                             "Kappa", "F1", "AUC", "FN", "FP")
+
+kable(comparison_table, caption = "Final Model Comparison: Test Set Performance", align = "c") %>%
+  kable_styling(position = "center", full_width = FALSE)
+```
+
+## Variable Importance Comparison
+
+```{r imp-all}
+rf_imp <- importance(comet_rf_model_tune_2) |> as.data.frame() |>
+  rownames_to_column("Variable") |> dplyr::select(Variable, MeanDecreaseGini) |>
+  mutate(Model = "Random Forest")
+bag_imp <- importance(final_bag) |> as.data.frame() |>
+  rownames_to_column("Variable") |> dplyr::select(Variable, MeanDecreaseGini) |>
+  mutate(Model = "Bagging")
+boost_imp <- varImp(model_boost)$importance |> as.data.frame() |>
+  rownames_to_column("Variable") |> rename(MeanDecreaseGini = Overall) |>
+  mutate(Model = "Boosting")
+
+all_imp  <- rbind(rf_imp, bag_imp, boost_imp)
+top_vars <- all_imp |> group_by(Variable) |>
+  summarise(AvgImportance = mean(MeanDecreaseGini)) |>
+  arrange(desc(AvgImportance)) |> slice_head(n = 10) |> pull(Variable)
+
+all_imp |>
+  filter(Variable %in% top_vars) |>
+  mutate(Variable = reorder(Variable, MeanDecreaseGini)) |>
+  ggplot(aes(x = MeanDecreaseGini, y = Variable, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Variable Importance Comparison Across Models",
+       x = "Mean Decrease Gini / Importance", y = "Variable") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Random Forest" = "blue", "Bagging" = "darkgreen", "Boosting" = "red"))
+```
+
+## All Models on the Test Set
+
+Step 2 sensitivity and specificity are taken at each model's ROC-optimal point.
+
+```{r all-models, fig.width = 10, fig.height = 5}
+predictors_test_hco_data <- as.matrix(test_hco_data[, names(test_hco_data) != "Hazardous"])
+target_test_hco          <- as.numeric(as.character(test_hco_data$Hazardous))
+
+pred_baseline_test <- predict(baseline_model_hco_data, newdata = test_hco_data, type = "response")
+pred_stepwise_test <- predict(stepwise_hco_data,       newdata = test_hco_data, type = "response")
+pred_best_test     <- predict(fit_best,                newdata = test_hco_data, type = "response")
+pred_ridge_test    <- predict(ridge_5_fold_hco_data, newx = predictors_test_hco_data,
+                              s = ridge_lambda_min_hco_data, type = "response")[, 1]
+pred_lasso_test    <- predict(lasso_5_fold_hco_data, newx = predictors_test_hco_data,
+                              s = lasso_lambda_min_hco_data, type = "response")[, 1]
+
+roc_baseline_test <- roc(target_test_hco, pred_baseline_test, quiet = TRUE)
+roc_stepwise_test <- roc(target_test_hco, pred_stepwise_test, quiet = TRUE)
+roc_best_test     <- roc(target_test_hco, pred_best_test,     quiet = TRUE)
+roc_ridge_test    <- roc(target_test_hco, pred_ridge_test,    quiet = TRUE)
+roc_lasso_test    <- roc(target_test_hco, pred_lasso_test,    quiet = TRUE)
+
+get_best_coords <- function(roc_obj, metric) {
+  round(as.numeric(coords(roc_obj, "best", ret = metric, transpose = FALSE)[1, ]), 4)
+}
+
+step2_rocs <- list(roc_baseline_test, roc_stepwise_test, roc_best_test, roc_ridge_test, roc_lasso_test)
+
+all_models_table <- data.frame(
+  Model = c("Baseline Logistic", "Stepwise", "Best Subset", "Ridge", "LASSO",
+            "Random Forest", "Bagging", "Boosting"),
+  AUC = c(sapply(step2_rocs, function(r) round(as.numeric(auc(r)), 4)),
+          round(as.numeric(auc(roc_rf)), 4), round(bag_auc, 4), as.numeric(ROC_AUC)),
+  Sensitivity = c(sapply(step2_rocs, get_best_coords, metric = "sensitivity"),
+                  round(rf_cm$byClass["Sensitivity"], 4),
+                  round(bag_cm$byClass["Sensitivity"], 4),
+                  round(cm_boost_test$byClass["Sensitivity"], 4)),
+  Specificity = c(sapply(step2_rocs, get_best_coords, metric = "specificity"),
+                  round(rf_cm$byClass["Specificity"], 4),
+                  round(bag_cm$byClass["Specificity"], 4),
+                  round(cm_boost_test$byClass["Specificity"], 4))
+)
+kable(all_models_table, caption = "All Models: Test Set", align = "c") %>%
+  kable_styling(position = "center", full_width = FALSE)
+
+all_models_long <- pivot_longer(all_models_table, cols = -Model, names_to = "Metric", values_to = "Value")
+all_models_long$Model <- factor(all_models_long$Model, levels = all_models_table$Model)
+
+ggplot(all_models_long, aes(x = Model, y = Value, fill = Model)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = round(Value, 3)), vjust = -0.3, size = 2.5) +
+  facet_wrap(~ Metric, ncol = 3) +
+  scale_y_continuous(limits = c(0.85, 1.02), oob = scales::squish) +
+  labs(title = "Model Performance Comparison: All Models (Test Set)", x = NULL, y = "Value") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+```
+
+# Session Info
+
+```{r session}
+sessionInfo()
+```
