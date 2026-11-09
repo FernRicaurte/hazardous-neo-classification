@@ -16,7 +16,7 @@ Team project for STA 5703 *Data Mining Methodology I*, M.S. in Data Analytics, U
 | **Data** | NASA NeoWs close-approach records, 1950–2025: 375,659 rows reduced to **35,430 unique objects** with 18 predictors |
 | **Target** | `Hazardous` (TRUE/FALSE). Only **7%** of objects are hazardous |
 | **Models** | 8: logistic regression, best subset, stepwise, Ridge, LASSO, random forest, bagging, gradient boosting |
-| **Best result** | Random forest and gradient boosting tied: **AUC 0.999**, Kappa 0.985–0.986, **8 of 499** hazardous objects missed on the test set |
+| **Best result** | Random forest and gradient boosting tied: **AUC 0.999**, Kappa 0.985–0.986, **8 of 499** hazardous objects missed on the test set ([why so high?](#why-is-the-auc-so-high-a-leakage-check)) |
 
 ## Why it matters
 
@@ -62,11 +62,30 @@ Five or six variables do as well as all eighteen. Ridge scores lowest because it
 
 Every method, from LASSO to boosting, agrees on the same three predictors: **minimum orbit intersection distance** (how close the object's orbit comes to Earth's), **absolute magnitude** (brightness, a proxy for size) and **estimated diameter**. Closer, larger objects are the hazardous ones.
 
+### Why is the AUC so high? A leakage check
+
+*Follow-up analysis by Fernando Ricaurte, after the course.*
+
+An AUC of 0.999 is close enough to perfect to be suspicious, so I checked how the label is defined. NASA classifies an asteroid as potentially hazardous when its **minimum orbit intersection distance is 0.05 AU or less** and its **absolute magnitude is 22 or less**. Both are predictors in this dataset, so the target is largely a fixed rule applied to two of the inputs.
+
+[`leakage_analysis.R`](leakage_analysis.R) tests this on the same test set:
+
+| Approach | Kappa | AUC | Missed | False alarms |
+|---|---|---|---|---|
+| NASA's two-cutoff rule, no model | 0.984 | — | 12 | 3 |
+| Random forest, all predictors | 0.986 | 0.9993 | 8 | 5 |
+| Random forest without MOID, absolute magnitude and diameter | 0.368 | 0.938 | 32 | 1,173 |
+
+- NASA's rule alone matches the label for **99.88%** of all 35,430 objects. The near-perfect scores mostly reflect the models **rediscovering NASA's definition**.
+- Without the defining variables (estimated diameter is computed from absolute magnitude, so it was removed too), the model still ranks objects well (AUC 0.938), but precision falls to 0.28. Orbit uncertainty, perihelion distance and velocity carry real signal, but not enough to replace the rule.
+- **Takeaway:** the ensemble results are best read as reproducing NASA's classification, not as a new way to detect hazards. Checking whether a target is built from its own predictors is a step worth taking whenever a score looks too good.
+
 ## Repository contents
 
 | File | Description |
 |---|---|
 | [`analysis.Rmd`](analysis.Rmd) | Full analysis: cleaning, EDA, all eight models, comparison |
+| [`leakage_analysis.R`](leakage_analysis.R) | Follow-up leakage check: NASA's hazard rule vs. the models, and a model without the defining variables |
 | [`report/Hazardous_Celestial_Objects_Full_Analysis.pdf`](report/Hazardous_Celestial_Objects_Full_Analysis.pdf) | The knitted analysis, with all code, tables and charts |
 | [`report/Hazardous_Celestial_Objects_Presentation.pdf`](report/Hazardous_Celestial_Objects_Presentation.pdf) | Project presentation slides |
 | [`data/cleaned_neows_1950_2025.xlsx`](data/) | Cleaned dataset (35,430 objects) |
