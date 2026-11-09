@@ -29,12 +29,6 @@ knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
                       dev = "png", dpi = 150)
 ```
 
-> **About this version.** This is the team's final analysis with two
-> refinements: (1) every model, from logistic regression to boosting, is
-> evaluated on the same validation and test rows (Section 4.2), and
-> (2) the Random Forest threshold is read from the validation ROC curve rather
-> than typed in, so the results reproduce on any machine (Section 5.1).
-
 # Libraries
 
 ```{r libraries}
@@ -235,14 +229,6 @@ comets_model$Hazardous <- factor(
 
 A single stratified 60/20/20 split is shared by every model.
 
-> **Correction (post-course).** In the original notebook, the Step 2 sets were
-> built with `hco_data[val_idx, ]` and `hco_data[-c(train_idx, val_idx), ]`.
-> But `val_idx` holds row positions *within* `temp` (the 40% held out from
-> training), not within the full dataset, so the Step 2 validation and test
-> sets overlapped the training set. The lines below take `val_idx` from the
-> held-out rows, so Step 2 now uses exactly the same validation and test rows
-> as the ensemble models.
-
 ```{r split}
 set.seed(5703)
 train_idx   <- createDataPartition(comets_model$Hazardous, p = 0.6, list = FALSE)
@@ -255,7 +241,7 @@ comet_test <- temp[-val_idx, ]
 
 minority_n <- min(table(comet_train$Hazardous))
 
-# Same rows for the Step 2 models (corrected indexing)
+# Same rows for the logistic-family models
 hco_heldout         <- hco_data[-train_idx, ]
 train_hco_data      <- hco_data[train_idx, ]
 validation_hco_data <- hco_heldout[val_idx, ]
